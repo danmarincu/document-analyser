@@ -1,0 +1,3 @@
+This is sample document for test purposes. It does not have much meaning.
+You can add your lines here to test out the application capabilities of summarizing and making sense
+of the content.

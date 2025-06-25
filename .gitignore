@@ -1,0 +1,8 @@
+.aws-sam
+samconfig.toml
+webapp-frontend/node_modules
+node_modules
+.DS_Store
+docs/*.bkp
+docs/*.drawio
+docs/.$document-analyser-architecture.drawio.bkp

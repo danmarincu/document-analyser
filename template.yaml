@@ -1,0 +1,312 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Smart Document Processing System using AWS SAM
+
+Globals:
+  Function:
+    Timeout: 30
+    MemorySize: 256
+    Runtime: nodejs22.x
+    Environment:
+      Variables:
+        LOG_LEVEL: info
+
+Parameters:
+  Stage:
+    Type: String
+    Default: dev
+    Description: Deployment stage
+
+Resources:  
+  ApiKeySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub document-analyser-${Stage}-api-key
+      Description: API Key for Document Analyser API Gateway
+      GenerateSecretString:
+        SecretStringTemplate: '{}'
+        GenerateStringKey: "api_key"
+        PasswordLength: 32
+        ExcludeCharacters: '"@/\\'
+
+  AppRunnerInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: build.apprunner.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSAppRunnerServicePolicyForECRAccess
+      Policies:
+        - PolicyName: SecretsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref ApiKeySecret
+
+  WebappService:
+    Type: AWS::AppRunner::Service
+    DependsOn: [ApiKey, ApiKeyUsagePlanMapping]
+    Properties:
+      ServiceName: !Sub document-analyser-${Stage}
+      SourceConfiguration:
+        AuthenticationConfiguration:
+          AccessRoleArn: !GetAtt AppRunnerInstanceRole.Arn
+        ImageRepository:
+          ImageIdentifier: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/document-analyser-${Stage}-webapp:latest
+          ImageRepositoryType: ECR
+          ImageConfiguration:
+            Port: "8080"
+            RuntimeEnvironmentVariables:
+              - Name: API_ENDPOINT
+                Value: !Sub "https://${ApiGatewayApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}/"
+              - Name: API_KEY
+                Value: !Sub '{{resolve:secretsmanager:${ApiKeySecret}:SecretString:api_key}}'
+      HealthCheckConfiguration:
+        Path: /health
+        Protocol: HTTP
+        HealthyThreshold: 1
+        UnhealthyThreshold: 2
+        Interval: 4
+        Timeout: 3
+
+  DocumentsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub document-analyser-${Stage}-documents
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: [GET, PUT, POST, DELETE]
+            AllowedOrigins: ['*']
+
+  DocumentsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub document-analyser-${Stage}-documents
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+
+  ApiGatewayApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: !Sub ${Stage}
+      OpenApiVersion: "3.0.1"
+      Cors:
+        AllowMethods: "'*'"
+        AllowHeaders: "'*'"
+        AllowOrigin: "'*'"
+      Auth:
+        ApiKeyRequired: true 
+        AddApiKeyRequiredToCorsPreflight: false
+        UsagePlan:
+          CreateUsagePlan: PER_API
+          UsagePlanName: !Sub document-analyser-${Stage}-plan
+          Throttle:
+            RateLimit: 100
+            BurstLimit: 50
+          Quota:
+            Limit: 10000
+            Period: MONTH
+
+  ApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    DependsOn: 
+      ApiGatewayApiStage
+    Properties:
+      Name: !Sub document-analyser-${Stage}-key
+      Description: API Key for the Document Analyser API
+      Enabled: true
+      Value: !Sub '{{resolve:secretsmanager:${ApiKeySecret}:SecretString:api_key}}'
+      StageKeys:
+        - RestApiId: !Ref ApiGatewayApi
+          StageName: !Sub ${Stage}
+
+  ApiKeyUsagePlanMapping:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref ApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref ApiGatewayApi.UsagePlan
+
+  UploadDocumentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src/handlers/upload.handler
+      Runtime: nodejs22.x
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref DocumentsBucket
+          TABLE_NAME: !Ref DocumentsTable
+          BEDROCK_MODEL_ID: anthropic.claude-v2
+      Events:
+        UploadDocument:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGatewayApi
+            Path: /documents
+            Method: post
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - s3:PutObject
+                - s3:GetObject
+                - s3:DeleteObject
+              Resource: !Sub arn:aws:s3:::document-analyser-${Stage}-documents/*
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DocumentsTable
+
+  ProcessDocumentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src/handlers/process.handler
+      Runtime: nodejs22.x
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref DocumentsTable
+          BEDROCK_MODEL_ID: anthropic.claude-v2
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+              Resource: !Sub arn:aws:s3:::document-analyser-${Stage}-documents/*
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DocumentsTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+              Resource: "*"
+
+
+  ProcessDocumentRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "Rule to trigger document processing when new files are uploaded"
+      EventPattern:
+        source: ["aws.s3"]
+        detail-type: ["Object Created"]
+        detail:
+          bucket:
+            name: [!Ref DocumentsBucket]
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ProcessDocumentFunction.Arn
+          Id: ProcessDocumentFunction
+
+  ProcessDocumentPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ProcessDocumentFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ProcessDocumentRule.Arn
+
+  GetDocumentsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src/handlers/list.handler
+      Runtime: nodejs22.x
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref DocumentsTable
+          BEDROCK_MODEL_ID: anthropic.claude-v2
+      Events:
+        GetDocuments:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGatewayApi
+            Path: /documents
+            Method: get
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref DocumentsTable
+
+
+  GetDocumentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src/handlers/get.handler
+      Runtime: nodejs22.x
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref DocumentsBucket
+          TABLE_NAME: !Ref DocumentsTable
+          BEDROCK_MODEL_ID: anthropic.claude-v2
+      Events:
+        GetDocument:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGatewayApi
+            Path: /documents/{id}
+            Method: get
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:ListBucket
+              Resource: 
+                - !Sub arn:aws:s3:::document-analyser-${Stage}-documents/*
+                - !Sub arn:aws:s3:::document-analyser-${Stage}-documents
+        - DynamoDBReadPolicy:
+            TableName: !Ref DocumentsTable
+
+  DeleteDocumentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src/handlers/delete.handler
+      Runtime: nodejs22.x
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref DocumentsBucket
+          TABLE_NAME: !Ref DocumentsTable
+          BEDROCK_MODEL_ID: anthropic.claude-v2
+      Events:
+        DeleteDocument:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGatewayApi
+            Path: /documents/{id}
+            Method: delete
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - s3:DeleteObject
+                - s3:GetObject
+              Resource: !Sub arn:aws:s3:::document-analyser-${Stage}-documents/*
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DocumentsTable
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub "https://${ApiGatewayApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}/"
+  DocumentsBucketName:
+    Description: Name of the S3 bucket for document storage
+    Value: !Ref DocumentsBucket
+  DocumentsTableName:
+    Description: Name of the DynamoDB table
+    Value: !Ref DocumentsTable
+  WebappServiceUrl:
+    Description: URL of the App Runner webapp service
+    Value: !GetAtt WebappService.ServiceUrl
